@@ -66,7 +66,12 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             git diff origin/${{ github.base_ref }}...HEAD > changes.diff
           else
-            git diff HEAD~1...HEAD > changes.diff
+            # On first commit HEAD~1 doesn't exist; fall back to empty-tree diff
+            if git rev-parse HEAD~1 > /dev/null 2>&1; then
+              git diff HEAD~1 HEAD > changes.diff
+            else
+              git diff 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD > changes.diff
+            fi
           fi
           head -c 50000 changes.diff > changes_truncated.diff
 
