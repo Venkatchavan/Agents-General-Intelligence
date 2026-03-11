@@ -80,8 +80,16 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          # Skip if API key is not configured
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "## Security Engineer — Skipped" > security_output.md
+            echo "ANTHROPIC_API_KEY secret is not set. Skipping AI security review." >> security_output.md
+            echo "critical_found=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           DIFF_CONTENT=$(cat changes_truncated.diff | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
-          
+
           RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
             -H "Content-Type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
@@ -95,10 +103,20 @@ jobs:
                 \"content\": \"Review the following code changes for security vulnerabilities:\n\n\" + $DIFF_CONTENT
               }]
             }")
-          
-          REVIEW=$(echo $RESPONSE | python3 -c "import sys,json; data=json.load(sys.stdin); print(data['content'][0]['text'])")
+
+          # Parse response safely — handle API errors
+          REVIEW=$(echo $RESPONSE | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+if 'content' in data:
+    print(data['content'][0]['text'])
+elif 'error' in data:
+    print('## Security Engineer — API Error\n\n**Error**: ' + data['error'].get('message', str(data['error'])))
+else:
+    print('## Security Engineer — Unknown Response\n\n' + json.dumps(data, indent=2))
+")
           echo "$REVIEW" > security_output.md
-          
+
           # Check for CRITICAL findings to set exit code
           if echo "$REVIEW" | grep -q "CRITICAL"; then
             echo "critical_found=true" >> $GITHUB_OUTPUT
