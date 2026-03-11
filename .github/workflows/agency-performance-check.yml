@@ -1,0 +1,221 @@
+name: Agency Performance Benchmarker — Performance Gate
+
+on:
+  deployment_status:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'URL to run performance check against'
+        required: true
+      environment:
+        description: 'Environment name (staging/production)'
+        required: false
+        default: 'staging'
+
+permissions:
+  contents: read
+  pull-requests: write
+  deployments: write
+  statuses: write
+
+env:
+  # Thresholds — adjust per project requirements
+  LCP_THRESHOLD_MS: 2500
+  FID_THRESHOLD_MS: 100
+  CLS_THRESHOLD: 0.1
+  TTI_THRESHOLD_MS: 3800
+  PERFORMANCE_SCORE_MIN: 75
+  
+  AGENT_INSTRUCTIONS: |
+    You are the Performance Benchmarker from The Agency. You interpret raw web performance
+    metrics and provide actionable recommendations.
+    
+    You evaluate:
+    1. Core Web Vitals: LCP, FID/INP, CLS
+    2. Load performance: TTI, TBT, FCP
+    3. Resource efficiency: JS bundle size, image optimization, caching headers
+    4. Regression detection: Compare to baseline if available
+    
+    Severity:
+    - CRITICAL: Users will abandon. Fix before production.
+    - HIGH: Significant UX impact. Fix within sprint.
+    - MEDIUM: Noticeable, fix in next sprint.
+    - LOW: Optimization opportunity.
+    
+    Output format:
+    ## Performance Benchmarker — Report
+    
+    **Environment**: [staging/production]
+    **Overall Score**: [0-100]
+    **Status**: [PASS / WARN / FAIL]
+    
+    ### Core Web Vitals
+    | Metric | Value | Threshold | Status |
+    |--------|-------|-----------|--------|
+    
+    ### Findings & Recommendations
+    | Severity | Finding | Expected Saving | Fix |
+    |----------|---------|----------------|-----|
+    
+    ### Summary
+    [2-3 sentences: honest performance verdict and top priority action]
+
+jobs:
+  performance-check:
+    runs-on: ubuntu-latest
+    name: Performance Benchmarker
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'deployment_status' && 
+       github.event.deployment_status.state == 'success' &&
+       contains(fromJSON('["staging", "preview"]'), github.event.deployment_status.environment))
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine Target URL
+        id: url
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "url=${{ github.event.inputs.target_url }}" >> $GITHUB_OUTPUT
+            echo "env=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            echo "url=${{ github.event.deployment_status.target_url }}" >> $GITHUB_OUTPUT
+            echo "env=${{ github.event.deployment_status.environment }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Lighthouse CI
+        run: npm install -g @lhci/cli@0.14.x
+
+      - name: Run Lighthouse
+        id: lighthouse
+        run: |
+          TARGET_URL="${{ steps.url.outputs.url }}"
+          
+          lhci collect \
+            --url="$TARGET_URL" \
+            --settings.chromeFlags="--no-sandbox --headless" \
+            --numberOfRuns=3 \
+            --output=json \
+            --outputPath=lhci_output.json || true
+          
+          # Parse core metrics from Lighthouse output
+          if [ -f lhci_output.json ]; then
+            python3 -c "
+          import json, sys
+
+          with open('lhci_output.json') as f:
+              data = json.load(f)
+
+          runs = data if isinstance(data, list) else [data]
+          if not runs:
+              print('No runs found')
+              sys.exit(1)
+
+          lhr = runs[0]  # Use first run
+          cats = lhr.get('categories', {})
+          audits = lhr.get('audits', {})
+
+          perf_score = int((cats.get('performance', {}).get('score', 0) or 0) * 100)
+          lcp = int((audits.get('largest-contentful-paint', {}).get('numericValue', 0) or 0))
+          fid = int((audits.get('max-potential-fid', {}).get('numericValue', 0) or 0))
+          cls = round(float(audits.get('cumulative-layout-shift', {}).get('numericValue', 0) or 0), 3)
+          tti = int((audits.get('interactive', {}).get('numericValue', 0) or 0))
+          fcp = int((audits.get('first-contentful-paint', {}).get('numericValue', 0) or 0))
+
+          metrics = {
+              'performance_score': perf_score,
+              'lcp_ms': lcp,
+              'fid_ms': fid,
+              'cls': cls,
+              'tti_ms': tti,
+              'fcp_ms': fcp
+          }
+          print(json.dumps(metrics))
+          " > parsed_metrics.json
+          else
+            echo '{"performance_score": 0, "lcp_ms": 0, "fid_ms": 0, "cls": 0, "tti_ms": 0, "fcp_ms": 0}' > parsed_metrics.json
+          fi
+          
+          cat parsed_metrics.json
+
+      - name: Analyze with Performance Benchmarker Agent
+        id: analysis
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          METRICS=$(cat parsed_metrics.json)
+          TARGET_URL="${{ steps.url.outputs.url }}"
+          ENVIRONMENT="${{ steps.url.outputs.env }}"
+          
+          METRICS_TEXT="URL: $TARGET_URL\nEnvironment: $ENVIRONMENT\n\nMetrics:\n$METRICS\n\nThresholds:\n- LCP: ${LCP_THRESHOLD_MS}ms\n- FID: ${FID_THRESHOLD_MS}ms\n- CLS: ${CLS_THRESHOLD}\n- TTI: ${TTI_THRESHOLD_MS}ms\n- Min Performance Score: ${PERFORMANCE_SCORE_MIN}"
+          
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "{
+              \"model\": \"claude-3-5-sonnet-20241022\",
+              \"max_tokens\": 2048,
+              \"system\": $(echo "$AGENT_INSTRUCTIONS" | python3 -c \"import sys,json; print(json.dumps(sys.stdin.read()))\"),
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": $(echo "$METRICS_TEXT" | python3 -c \"import sys,json; print(json.dumps(sys.stdin.read()))\")
+              }]
+            }")
+          
+          REVIEW=$(echo $RESPONSE | python3 -c "import sys,json; data=json.load(sys.stdin); print(data['content'][0]['text'])")
+          echo "$REVIEW" > perf_report.md
+          
+          # Check if score meets minimum
+          SCORE=$(python3 -c "import json; d=json.load(open('parsed_metrics.json')); print(d.get('performance_score', 0))")
+          if [ "$SCORE" -lt "$PERFORMANCE_SCORE_MIN" ]; then
+            echo "gate=fail" >> $GITHUB_OUTPUT
+          else
+            echo "gate=pass" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Find Associated PR
+        id: find_pr
+        if: github.event_name == 'deployment_status'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.sha;
+            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              ...context.repo,
+              commit_sha: sha
+            });
+            const openPR = prs.data.find(pr => pr.state === 'open');
+            core.setOutput('pr_number', openPR ? openPR.number : '');
+
+      - name: Post Performance Report
+        if: steps.find_pr.outputs.pr_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('perf_report.md', 'utf8');
+            const gate = '${{ steps.analysis.outputs.gate }}';
+            const emoji = gate === 'pass' ? '✅' : '⚠️';
+            
+            const body = `${emoji} **Agency Performance Gate** — ${gate.toUpperCase()}\n\n${report}\n\n---\n*Generated by [Performance Benchmarker](../../specialized/) · The Agency*`;
+            
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: ${{ steps.find_pr.outputs.pr_number || 0 }},
+              body: body
+            });
+
+      - name: Output Report (no PR context)
+        if: steps.find_pr.outputs.pr_number == ''
+        run: |
+          echo "=== Performance Report ==="
+          cat perf_report.md
+
+      - name: Fail on Performance Regression
+        if: steps.analysis.outputs.gate == 'fail'
+        run: |
+          echo "::warning::Performance score is below threshold (${PERFORMANCE_SCORE_MIN}). Review the Performance Benchmarker report."
+          # Warning only — does not block deploy, but visibility is required

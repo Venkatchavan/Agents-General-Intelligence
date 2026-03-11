@@ -1,0 +1,133 @@
+name: Agency Reality Checker — Release Gate
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual release gate check'
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  AGENT_INSTRUCTIONS: |
+    You are Reality Checker from The Agency — the final quality gate before production.
+    
+    Your job is to certify or reject a release based on provided evidence.
+    Default to NEEDS WORK unless you have overwhelming positive evidence.
+    "Zero issues found" is suspicious — look for gaps in the evidence.
+    
+    Evaluate the release based on:
+    1. Does the release notes describe what was actually built?
+    2. Are all claimed features verified with evidence?
+    3. Are there known open issues that should block this release?
+    4. Is the version number appropriate for the changes (breaking/feature/patch)?
+    5. Are rollback procedures documented?
+    
+    Grading:
+    - A: Production ready, evidence is complete
+    - B: Production ready with minor documentation gaps
+    - C: Needs work before production — specific issues must be resolved
+    - D: Not ready — significant gaps
+    - F: Do not release — critical issues present
+    
+    Output format:
+    ## Reality Checker — Release Gate Assessment
+    
+    **Release**: [version]
+    **Grade**: [A/B/C/D/F]
+    **Status**: [APPROVED / CONDITIONAL / REJECTED]
+    
+    ### Evidence Reviewed
+    [What was available for review]
+    
+    ### Findings
+    | Severity | Finding | Impact | Required Action |
+    |----------|---------|--------|----------------|
+    
+    ### Certification Statement
+    [Honest 2-3 sentence assessment]
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    name: Reality Checker Release Gate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Gather Release Evidence
+        id: evidence
+        run: |
+          echo "release_tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          echo "release_name=${{ github.event.release.name }}" >> $GITHUB_OUTPUT
+          
+          # Collect: git log since last tag
+          LAST_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            git log $LAST_TAG..HEAD --oneline > commit_log.txt
+          else
+            git log --oneline -50 > commit_log.txt
+          fi
+
+      - name: Run Reality Checker
+        id: reality
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          RELEASE_BODY=$(echo "${{ github.event.release.body }}" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          COMMITS=$(cat commit_log.txt | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "{
+              \"model\": \"claude-3-5-sonnet-20241022\",
+              \"max_tokens\": 2048,
+              \"system\": $(echo "$AGENT_INSTRUCTIONS" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))"),
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"Release Version: ${{ github.event.release.tag_name }}\n\nRelease Notes:\n\" + $RELEASE_BODY + \"\n\nCommits in this release:\n\" + $COMMITS
+              }]
+            }")
+          
+          REVIEW=$(echo $RESPONSE | python3 -c "import sys,json; data=json.load(sys.stdin); print(data['content'][0]['text'])")
+          echo "$REVIEW" > reality_check_output.md
+          
+          if echo "$REVIEW" | grep -q "REJECTED"; then
+            echo "status=rejected" >> $GITHUB_OUTPUT
+          elif echo "$REVIEW" | grep -q "CONDITIONAL"; then
+            echo "status=conditional" >> $GITHUB_OUTPUT
+          else
+            echo "status=approved" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const review = fs.readFileSync('reality_check_output.md', 'utf8');
+            const status = '${{ steps.reality.outputs.status }}';
+            const emoji = status === 'approved' ? '✅' : status === 'conditional' ? '⚠️' : '🚫';
+            
+            // Post as issue comment on release
+            await github.rest.repos.createRelease({
+              ...context.repo,
+            });
+            
+            console.log(`Release gate status: ${status}`);
+            console.log(review);
+
+      - name: Block on Rejection
+        if: steps.reality.outputs.status == 'rejected'
+        run: |
+          echo "::error::Reality Checker REJECTED this release. Review the assessment before proceeding."
+          exit 1

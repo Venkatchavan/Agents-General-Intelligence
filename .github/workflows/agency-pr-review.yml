@@ -1,0 +1,111 @@
+name: Agency Evidence Collector — PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  # Edit this to match your project's tech stack and standards
+  AGENT_INSTRUCTIONS: |
+    You are Evidence Collector, a QA specialist from The Agency.
+    Your job is to review this pull request with skepticism and evidence-based assessment.
+    
+    Rules:
+    - Default to finding issues, not approving
+    - "Zero issues found" is a red flag — look harder
+    - Every issue must have: file, line, specific problem, severity (Critical/High/Medium/Low)
+    - Do NOT approve speculatively — only approve with evidence
+    
+    Review the diff for:
+    1. Correctness: Does the code do what the PR description claims?
+    2. Edge cases: What inputs or states could break this?
+    3. Security: Any XSS, injection, auth bypass, or data exposure risks?
+    4. Performance: Any N+1 queries, missing indexes, or blocking operations?
+    5. Accessibility: Any ARIA, keyboard navigation, or contrast issues in UI changes?
+    
+    Output format:
+    ## Evidence Collector — PR Review
+    
+    **Overall Status**: [NEEDS WORK / CONDITIONAL PASS / PASS]
+    
+    ### Issues Found
+    | Severity | File | Line | Issue | Suggested Fix |
+    |----------|------|------|-------|---------------|
+    
+    ### What Looks Good
+    - [Specific things that are well implemented]
+    
+    ### Confidence: [0-100%]
+    [Reason for this confidence level]
+
+jobs:
+  evidence-collector-review:
+    runs-on: ubuntu-latest
+    name: Evidence Collector Review
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR Diff
+        id: diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > pr.diff
+          # Truncate if too large (API context limit)
+          head -c 50000 pr.diff > pr_truncated.diff
+          echo "diff_size=$(wc -c < pr.diff)" >> $GITHUB_OUTPUT
+
+      - name: Get PR Description
+        id: pr_info
+        run: |
+          echo "title=${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "${{ github.event.pull_request.body }}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Run Evidence Collector Agent
+        id: agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          DIFF_CONTENT=$(cat pr_truncated.diff | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "{
+              \"model\": \"claude-3-5-sonnet-20241022\",
+              \"max_tokens\": 2048,
+              \"system\": $(echo "$AGENT_INSTRUCTIONS" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))"),
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"PR Title: ${{ github.event.pull_request.title }}\n\nPR Description: ${{ github.event.pull_request.body }}\n\nCode Diff:\n\" + $DIFF_CONTENT
+              }]
+            }")
+          
+          REVIEW=$(echo $RESPONSE | python3 -c "import sys,json; data=json.load(sys.stdin); print(data['content'][0]['text'])")
+          
+          # Write to file to preserve newlines
+          echo "$REVIEW" > review_output.md
+          echo "review_written=true" >> $GITHUB_OUTPUT
+
+      - name: Post Review Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const review = fs.readFileSync('review_output.md', 'utf8');
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🔍 Agency: Evidence Collector Review\n\n${review}\n\n---\n*Automated review by [The Agency](https://github.com/Venkatchavan/Agents-General-Intelligence) — Evidence Collector agent*`
+            });

@@ -1,0 +1,125 @@
+name: Agency Security Engineer — Security Scan
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+env:
+  AGENT_INSTRUCTIONS: |
+    You are Security Engineer from The Agency — a security-first specialist.
+    
+    Review the provided code diff for security vulnerabilities using the OWASP Top 10 as your checklist:
+    1. Broken Access Control
+    2. Cryptographic Failures
+    3. Injection (SQL, XSS, Command injection, SSRF)
+    4. Insecure Design
+    5. Security Misconfiguration
+    6. Vulnerable and Outdated Components
+    7. Identification and Authentication Failures
+    8. Software and Data Integrity Failures
+    9. Security Logging and Monitoring Failures
+    10. Server-Side Request Forgery (SSRF)
+    
+    Also check for:
+    - Hardcoded secrets, API keys, or credentials
+    - Insecure dependencies or imports
+    - Missing input validation at system boundaries
+    - Insufficient error handling that leaks implementation details
+    
+    Critical rule: If you find a hardcoded secret, rate it CRITICAL immediately.
+    
+    Output format:
+    ## Security Engineer — Security Review
+    
+    **Risk Level**: [CRITICAL / HIGH / MEDIUM / LOW / CLEAN]
+    
+    ### Findings
+    | Severity | OWASP Category | File | Line | Vulnerability | Remediation |
+    |----------|---------------|------|------|--------------|-------------|
+    
+    ### Clean Areas
+    [What was reviewed and found clean]
+    
+    ### Recommended Actions
+    [Prioritized list of fixes]
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    name: Security Engineer Scan
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff origin/${{ github.base_ref }}...HEAD > changes.diff
+          else
+            git diff HEAD~1...HEAD > changes.diff
+          fi
+          head -c 50000 changes.diff > changes_truncated.diff
+
+      - name: Run Security Agent
+        id: security
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          DIFF_CONTENT=$(cat changes_truncated.diff | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "{
+              \"model\": \"claude-3-5-sonnet-20241022\",
+              \"max_tokens\": 2048,
+              \"system\": $(echo "$AGENT_INSTRUCTIONS" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))"),
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"Review the following code changes for security vulnerabilities:\n\n\" + $DIFF_CONTENT
+              }]
+            }")
+          
+          REVIEW=$(echo $RESPONSE | python3 -c "import sys,json; data=json.load(sys.stdin); print(data['content'][0]['text'])")
+          echo "$REVIEW" > security_output.md
+          
+          # Check for CRITICAL findings to set exit code
+          if echo "$REVIEW" | grep -q "CRITICAL"; then
+            echo "critical_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "critical_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post Security Review (on PR)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const review = fs.readFileSync('security_output.md', 'utf8');
+            const hasCritical = '${{ steps.security.outputs.critical_found }}' === 'true';
+            const emoji = hasCritical ? '🚨' : '🔒';
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ${emoji} Agency: Security Engineer Review\n\n${review}\n\n---\n*Automated security review by [The Agency](https://github.com/Venkatchavan/Agents-General-Intelligence)*`
+            });
+
+      - name: Fail on Critical Findings
+        if: steps.security.outputs.critical_found == 'true'
+        run: |
+          echo "::error::Security Engineer found CRITICAL vulnerabilities. Review required before merge."
+          exit 1
